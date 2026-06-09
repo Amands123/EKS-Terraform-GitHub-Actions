@@ -1,57 +1,223 @@
-properties([
-    parameters([
-        string(
-            defaultValue: 'dev',
-            name: 'Environment'
-        ),
-        choice(
-            choices: ['plan', 'apply', 'destroy'], 
-            name: 'Terraform_Action'
-        )])
-])
 pipeline {
+
     agent any
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(
+            numToKeepStr: '20',
+            artifactNumToKeepStr: '10'
+        ))
+        timeout(time: 60, unit: 'MINUTES')
+    }
+
+    parameters {
+
+        choice(
+            name: 'Environment',
+            choices: ['dev', 'qa', 'prod'],
+            description: 'Environment'
+        )
+
+        choice(
+            name: 'Terraform_Action',
+            choices: ['plan', 'apply', 'destroy'],
+            description: 'Terraform Action'
+        )
+    }
+
+    environment {
+        AWS_REGION = 'us-east-1'
+        TF_DIR     = 'eks'
+    }
+
     stages {
-        stage('Preparing') {
+
+        stage('Clean Workspace') {
             steps {
-                sh 'echo Preparing'
+                cleanWs()
             }
         }
-        stage('Git Pulling') {
+
+        stage('Checkout Code') {
             steps {
-                git branch: 'master', url: 'https://github.com/Amands123/EKS-Terraform-GitHub-Actions.git'
+                git branch: 'master',
+                    url: 'https://github.com/Amands123/EKS-Terraform-GitHub-Actions.git'
             }
         }
-        stage('Init') {
+
+        stage('Verify Tools') {
             steps {
-                withAWS(credentials: 'aws-creds', region: 'us-east-1') {
-                sh 'terraform -chdir=eks/ init'
+                sh '''
+                terraform version
+                aws --version
+                '''
+            }
+        }
+
+        stage('Verify AWS Access') {
+            steps {
+                withAWS(credentials: 'aws-creds', region: "${AWS_REGION}") {
+                    sh '''
+                    aws sts get-caller-identity
+                    '''
                 }
             }
         }
-        stage('Validate') {
+
+        stage('Terraform Init') {
             steps {
-                withAWS(credentials: 'aws-creds', region: 'us-east-1') {
-                sh 'terraform -chdir=eks/ validate'
+                withAWS(credentials: 'aws-creds', region: "${AWS_REGION}") {
+
+                    sh '''
+                    rm -rf ${TF_DIR}/.terraform
+
+                    terraform -chdir=${TF_DIR} init \
+                      -reconfigure
+                    '''
                 }
             }
         }
-        stage('Action') {
+
+        stage('Terraform Format Check') {
             steps {
-                withAWS(credentials: 'aws-creds', region: 'us-east-1') {
-                    script {    
-                        if (params.Terraform_Action == 'plan') {
-                            sh "terraform -chdir=eks/ plan -var-file=${params.Environment}.tfvars"
-                        }   else if (params.Terraform_Action == 'apply') {
-                            sh "terraform -chdir=eks/ apply -var-file=${params.Environment}.tfvars -auto-approve"
-                        }   else if (params.Terraform_Action == 'destroy') {
-                            sh "terraform -chdir=eks/ destroy -var-file=${params.Environment}.tfvars -auto-approve"
-                        } else {
-                            error "Invalid value for Terraform_Action: ${params.Terraform_Action}"
-                        }
-                    }
+                sh '''
+                terraform -chdir=${TF_DIR} fmt -check -recursive
+                '''
+            }
+        }
+
+        stage('Terraform Validate') {
+            steps {
+                withAWS(credentials: 'aws-creds', region: "${AWS_REGION}") {
+
+                    sh '''
+                    terraform -chdir=${TF_DIR} validate
+                    '''
                 }
             }
+        }
+
+        stage('Terraform Plan') {
+
+            when {
+                anyOf {
+                    expression { params.Terraform_Action == 'plan' }
+                    expression { params.Terraform_Action == 'apply' }
+                }
+            }
+
+            steps {
+
+                withAWS(credentials: 'aws-creds', region: "${AWS_REGION}") {
+
+                    sh """
+                    terraform -chdir=${TF_DIR} plan \
+                    -var-file=${params.Environment}.tfvars \
+                    -out=tfplan
+                    """
+
+                }
+
+                archiveArtifacts artifacts: "${TF_DIR}/tfplan",
+                fingerprint: true
+            }
+        }
+
+        stage('Approval For Apply') {
+
+            when {
+                expression {
+                    params.Terraform_Action == 'apply'
+                }
+            }
+
+            steps {
+
+                input(
+                    message: "Apply Terraform changes to ${params.Environment} ?",
+                    ok: "Deploy"
+                )
+
+            }
+        }
+
+        stage('Terraform Apply') {
+
+            when {
+                expression {
+                    params.Terraform_Action == 'apply'
+                }
+            }
+
+            steps {
+
+                withAWS(credentials: 'aws-creds', region: "${AWS_REGION}") {
+
+                    sh '''
+                    terraform -chdir=${TF_DIR} apply \
+                    -auto-approve tfplan
+                    '''
+
+                }
+            }
+        }
+
+        stage('Approval For Destroy') {
+
+            when {
+                expression {
+                    params.Terraform_Action == 'destroy'
+                }
+            }
+
+            steps {
+
+                input(
+                    message: "WARNING: Destroy Infrastructure?",
+                    ok: "Destroy"
+                )
+
+            }
+        }
+
+        stage('Terraform Destroy') {
+
+            when {
+                expression {
+                    params.Terraform_Action == 'destroy'
+                }
+            }
+
+            steps {
+
+                withAWS(credentials: 'aws-creds', region: "${AWS_REGION}") {
+
+                    sh """
+                    terraform -chdir=${TF_DIR} destroy \
+                    -var-file=${params.Environment}.tfvars \
+                    -auto-approve
+                    """
+
+                }
+            }
+        }
+    }
+
+    post {
+
+        success {
+            echo "Pipeline completed successfully."
+        }
+
+        failure {
+            echo "Pipeline failed. Review logs."
+        }
+
+        always {
+            archiveArtifacts artifacts: '**/*.log',
+            allowEmptyArchive: true
         }
     }
 }
